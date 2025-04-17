@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import logging
+from itertools import product
 from typing import Literal
 
+import narwhals.stable.v1 as nw
 import numpy as np
 import pandas as pd
+from narwhals.typing import IntoDataFrame, IntoSeries
 
 from ._annotated_metric_function import AnnotatedMetricFunction
 
@@ -28,10 +31,10 @@ _MF_CONTAINS_NON_SCALAR_ERROR_MESSAGE = (
 
 
 def apply_to_dataframe(
-    data: pd.DataFrame,
+    data: IntoDataFrame,
     metric_functions: dict[str, AnnotatedMetricFunction],
     include_groups: bool = False,
-) -> pd.Series:
+) -> np.ndarray:
     """Apply metric functions to a DataFrame.
 
     The incoming DataFrame may have been sliced via `groupby()`.
@@ -45,15 +48,7 @@ def apply_to_dataframe(
     We don't use this argument, and only include it so that we can be
     compatible with pandas<2.2
     """
-    values = dict()
-    for function_name, metric_function in metric_functions.items():
-        values[function_name] = metric_function(data)
-    # correctly handle zero provided metrics
-    if len(values) == 0:
-        result = pd.Series(dtype=float)
-    else:
-        result = pd.Series(values)
-    return result
+    return np.array([metric_function(data) for metric_function in metric_functions.values()])
 
 
 class DisaggregatedResult:
@@ -78,28 +73,27 @@ class DisaggregatedResult:
         the sensitive and control features
     """
 
-    def __init__(self, overall: pd.Series | pd.DataFrame, by_group: pd.DataFrame):
+    def __init__(self, overall: IntoSeries | IntoDataFrame, by_group: IntoDataFrame):
         """Construct an object."""
-        self._overall = overall
-        assert isinstance(by_group, pd.DataFrame)
-        self._by_group = by_group
+        self._overall = nw.from_native(overall, eager_only=True, allow_series=True)
+        self._by_group = nw.from_native(by_group, eager_only=True, pass_through=False)
 
     @property
-    def overall(self) -> pd.Series | pd.DataFrame:
+    def overall(self) -> IntoSeries | IntoDataFrame:
         """Return overall metrics."""
-        return self._overall
+        return self._overall.to_native()
 
     @property
-    def by_group(self) -> pd.DataFrame:
+    def by_group(self) -> IntoDataFrame:
         """Return the metrics by group."""
-        return self._by_group
+        return self._by_group.to_native()
 
     def apply_grouping(
         self,
         grouping_function: Literal["min", "max"],
         control_feature_names: list[str] | None = None,
         errors: Literal["raise", "coerce"] = "raise",
-    ) -> pd.Series | pd.DataFrame:
+    ) -> IntoSeries | IntoDataFrame:
         """Compute mins or maxes.
 
         Parameters
@@ -161,7 +155,7 @@ class DisaggregatedResult:
         control_feature_names: list[str] | None = None,
         method: Literal["between_groups", "to_overall"] = "between_groups",
         errors: Literal["raise", "coerce"] = "coerce",
-    ) -> pd.Series | pd.DataFrame:
+    ) -> IntoSeries | IntoDataFrame:
         """Return the maximum absolute difference between groups for each metric.
 
         This method calculates a scalar value for each underlying metric by
@@ -220,7 +214,7 @@ class DisaggregatedResult:
         control_feature_names: list[str] | None = None,
         method: Literal["between_groups", "to_overall"] = "between_groups",
         errors: Literal["raise", "coerce"] = "coerce",
-    ) -> pd.Series | pd.DataFrame:
+    ) -> IntoSeries | IntoDataFrame:
         """Return the minimum ratio between groups for each metric.
 
         This method calculates a scalar value for each underlying metric by
@@ -293,7 +287,7 @@ class DisaggregatedResult:
     @staticmethod
     def create(
         *,
-        data: pd.DataFrame,
+        data: IntoDataFrame,
         annotated_functions: dict[str, AnnotatedMetricFunction],
         sensitive_feature_names: list[str],
         control_feature_names: list[str] | None = None,
@@ -347,10 +341,10 @@ class DisaggregatedResult:
     @staticmethod
     def _apply_functions(
         *,
-        data: pd.DataFrame,
+        data: IntoDataFrame,
         annotated_functions: dict[str, AnnotatedMetricFunction],
         grouping_names: list[str] | None,
-    ) -> pd.Series | pd.DataFrame:
+    ) -> IntoSeries | IntoDataFrame:
         """
         Apply annotated metric functions to a DataFrame, optionally grouping by specified columns.
 
@@ -371,20 +365,55 @@ class DisaggregatedResult:
             A Series or DataFrame with the results of the metric functions applied. If grouping_names is provided,
             the results are grouped accordingly.
         """
-        if grouping_names is None or len(grouping_names) == 0:
-            return apply_to_dataframe(data, metric_functions=annotated_functions)
 
-        temp = data.groupby(grouping_names).apply(
-            apply_to_dataframe,
-            metric_functions=annotated_functions,
-            include_groups=False,
+        names = list(annotated_functions.keys())
+
+        nw_data = nw.from_native(data, eager_only=True)
+        implementation = nw_data.implementation
+
+        if grouping_names is None or len(grouping_names) == 0:
+            output_data = {
+                "metric": names,
+                "score": apply_to_dataframe(data, metric_functions=annotated_functions),
+            }
+            result = nw.maybe_set_index(
+                nw.from_dict(
+                    output_data,
+                    schema={"metric": nw.String(), "score": nw.Float64()},
+                    backend=implementation,
+                ),
+                "metric",
+            ).to_native()
+
+            return result["score"] if implementation.is_pandas_like() else result
+
+        input_schema = nw_data.schema
+        group_names_schema = {
+            group_name: input_schema[group_name] for group_name in grouping_names
+        }
+        output_schema = {**group_names_schema, **{name: nw.Float64() for name in names}}
+        temp = np.vstack(
+            [
+                np.hstack(
+                    [
+                        *key,
+                        apply_to_dataframe(
+                            data=group, metric_functions=annotated_functions, include_groups=False
+                        ),
+                    ]
+                )
+                for key, group in nw_data.group_by(grouping_names)
+            ]
         )
 
+        result = nw.from_numpy(temp, schema=output_schema, backend=implementation)
+
         if len(grouping_names) > 1:
-            all_indices = pd.MultiIndex.from_product(
-                [np.unique(data[col]) for col in grouping_names], names=grouping_names
+            _tmp = nw.from_numpy(
+                data=np.stack([*product(*[np.unique(nw_data[col]) for col in grouping_names])]),
+                schema=group_names_schema,
+                backend=implementation,
             )
+            result = _tmp.join(result, on=grouping_names, how="left")
 
-            return temp.reindex(index=all_indices)
-
-        return temp
+        return nw.maybe_set_index(result, grouping_names).to_native()
