@@ -75,7 +75,9 @@ class DisaggregatedResult:
 
     def __init__(self, overall: IntoSeries | IntoDataFrame, by_group: IntoDataFrame):
         """Construct an object."""
-        self._overall = nw.from_native(overall, eager_only=True, allow_series=True)
+        self._overall = nw.from_native(
+            overall, eager_only=True, allow_series=True, pass_through=False
+        )
         self._by_group = nw.from_native(by_group, eager_only=True, pass_through=False)
 
     @property
@@ -385,7 +387,11 @@ class DisaggregatedResult:
                 "metric",
             ).to_native()
 
-            return result["score"] if implementation.is_pandas_like() else result
+            return (
+                result["score"].rename(None).rename_axis(None)
+                if implementation.is_pandas_like()
+                else result
+            )
 
         input_schema = nw_data.schema
         group_names_schema = {
