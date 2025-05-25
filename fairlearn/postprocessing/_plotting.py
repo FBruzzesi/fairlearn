@@ -3,7 +3,8 @@
 
 """Utilities for plotting curves."""
 
-import pandas as pd
+import narwhals as nw
+from narwhals.typing import IntoDataFrame
 from sklearn.utils.validation import check_is_fitted
 
 from ._constants import _MATPLOTLIB_IMPORT_ERROR_MESSAGE
@@ -43,11 +44,14 @@ def _plot_solution(ax, x_best, y_best, solution_label, xlabel, ylabel):
     ax.set_ylabel(ylabel)
 
 
-def _plot_overall_tradeoff_curve(ax, overall_tradeoff_curve: pd.DataFrame) -> None:
+def _plot_overall_tradeoff_curve(ax, overall_tradeoff_curve: IntoDataFrame) -> None:
     """Plot the overall tradeoff curve."""
+    nw_overall_tradeoff_curve = nw.from_native(
+        overall_tradeoff_curve, eager_only=True, pass_through=False
+    )
     ax.plot(
-        overall_tradeoff_curve["x"],
-        overall_tradeoff_curve["y"],
+        nw_overall_tradeoff_curve.get_column("x").to_numpy(),
+        nw_overall_tradeoff_curve.get_column("y").to_numpy(),
         c="b",
         ls="--",
         lw=2.0,
