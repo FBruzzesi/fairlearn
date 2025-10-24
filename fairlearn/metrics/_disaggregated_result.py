@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
-from typing import Literal
+from typing import Generic, Literal, TypeVar
 
+import narwhals.stable.v1 as nw
 import numpy as np
 import pandas as pd
+from narwhals.typing import IntoDataFrame, IntoDataFrameT, IntoSeries
 
 from ._annotated_metric_function import AnnotatedMetricFunction
 
@@ -28,35 +30,26 @@ _MF_CONTAINS_NON_SCALAR_ERROR_MESSAGE = (
 
 
 def apply_to_dataframe(
-    data: pd.DataFrame,
+    data: IntoDataFrameT,
     metric_functions: dict[str, AnnotatedMetricFunction],
-    include_groups: bool = False,
-) -> pd.Series:
-    """Apply metric functions to a DataFrame.
-
-    The incoming DataFrame may have been sliced via `groupby()`.
-    This function applies each annotated function in turn to the
-    supplied DataFrame.
-
-    The include_groups argument is weird. It appears that pandas
-    introduced it as an argument in v2.2, and immediately deprecated
-    it (dependent on when this is being read, may need to adjust):
-    https://pandas.pydata.org/docs/reference/api/pandas.core.groupby.DataFrameGroupBy.apply.html
-    We don't use this argument, and only include it so that we can be
-    compatible with pandas<2.2
-    """
-    values = dict()
-    for function_name, metric_function in metric_functions.items():
-        values[function_name] = metric_function(data)
-    # correctly handle zero provided metrics
-    if len(values) == 0:
-        result = pd.Series(dtype=float)
-    else:
-        result = pd.Series(values)
-    return result
+) -> IntoDataFrameT:
+    """Apply metric functions to a DataFrame."""
+    ns = nw.get_native_namespace(data)
+    values = {
+        "metric": metric_functions.keys(),
+        "value": [metric_function(data) for metric_function in metric_functions.values()],
+    }
+    result = nw.from_dict(
+        values, backend=ns, schema={"metric": nw.String(), "value": nw.Float64()}
+    )
+    return result.to_native()
 
 
-class DisaggregatedResult:
+OverallT = TypeVar("OverallT", IntoDataFrame, IntoSeries)
+ByGroupT = TypeVar("ByGroupT", bound=IntoDataFrame)
+
+
+class DisaggregatedResult(Generic[OverallT, ByGroupT]):
     """Pickier version of MetricFrame.
 
     This holds the internal result from a disaggregated metric
@@ -78,28 +71,27 @@ class DisaggregatedResult:
         the sensitive and control features
     """
 
-    def __init__(self, overall: pd.Series | pd.DataFrame, by_group: pd.DataFrame):
+    def __init__(self, overall: OverallT, by_group: ByGroupT):
         """Construct an object."""
-        self._overall = overall
-        assert isinstance(by_group, pd.DataFrame)
-        self._by_group = by_group
+        self._overall = nw.from_native(overall, allow_series=True)
+        self._by_group = nw.from_native(by_group, eager_only=True, pass_through=False)
 
     @property
-    def overall(self) -> pd.Series | pd.DataFrame:
+    def overall(self) -> OverallT:
         """Return overall metrics."""
-        return self._overall
+        return self._overall.to_native()
 
     @property
-    def by_group(self) -> pd.DataFrame:
+    def by_group(self) -> ByGroupT:
         """Return the metrics by group."""
-        return self._by_group
+        return self._by_group.to_native()
 
     def apply_grouping(
         self,
         grouping_function: Literal["min", "max"],
         control_feature_names: list[str] | None = None,
         errors: Literal["raise", "coerce"] = "raise",
-    ) -> pd.Series | pd.DataFrame:
+    ) -> ByGroupT:
         """Compute mins or maxes.
 
         Parameters
@@ -123,38 +115,34 @@ class DisaggregatedResult:
         if errors not in _VALID_ERROR_STRING:
             raise ValueError(_INVALID_ERRORS_VALUE_ERROR_MESSAGE)
 
+        agg_expr = getattr(nw.all(), grouping_function)()
         if not control_feature_names:
             if errors == "raise":
                 try:
-                    result = self.by_group.agg(grouping_function, axis=0)
+                    result = self._by_group.select(agg_expr)
                 except ValueError as ve:
                     raise ValueError(_MF_CONTAINS_NON_SCALAR_ERROR_MESSAGE) from ve
 
             elif errors == "coerce":
                 # Fill in the possible min/max values, else np.nan
-                mf = self.by_group.apply(
+                mf = self._by_group.apply(  # TODO
                     lambda x: x.apply(lambda y: y if np.isscalar(y) else np.nan)
                 )
                 result = mf.agg(grouping_function, axis=0)
         else:
             if errors == "raise":
                 try:
-                    result = self.by_group.groupby(level=control_feature_names).agg(
-                        grouping_function
-                    )
-
+                    result = self._by_group.group_by(control_feature_names).agg(agg_expr)
                 except ValueError as ve:
                     raise ValueError(_MF_CONTAINS_NON_SCALAR_ERROR_MESSAGE) from ve
             elif errors == "coerce":
                 # Fill all impossible columns with NaN before grouping metric frame
-                mf = self.by_group.apply(
+                mf = self.by_group.apply(  # TODO
                     lambda x: x.apply(lambda y: y if np.isscalar(y) else np.nan)
                 )
-                result = mf.groupby(level=control_feature_names).agg(grouping_function)
+                result = self._by_group.group_by(control_feature_names).agg(agg_expr)
 
-        assert isinstance(result, pd.Series) or isinstance(result, pd.DataFrame)
-
-        return result
+        return result.to_native()
 
     def difference(
         self,
@@ -347,10 +335,10 @@ class DisaggregatedResult:
     @staticmethod
     def _apply_functions(
         *,
-        data: pd.DataFrame,
+        data: IntoDataFrameT,
         annotated_functions: dict[str, AnnotatedMetricFunction],
         grouping_names: list[str] | None,
-    ) -> pd.Series | pd.DataFrame:
+    ) -> IntoDataFrameT:
         """
         Apply annotated metric functions to a DataFrame, optionally grouping by specified columns.
 
@@ -374,17 +362,17 @@ class DisaggregatedResult:
         if grouping_names is None or len(grouping_names) == 0:
             return apply_to_dataframe(data, metric_functions=annotated_functions)
 
-        temp = data.groupby(grouping_names).apply(
-            apply_to_dataframe,
-            metric_functions=annotated_functions,
-            include_groups=False,
+        data_nw = nw.from_native(data, eager_only=True, pass_through=False)
+
+        metrics = (
+            apply_to_dataframe(grp, metric_functions=annotated_functions)
+            for _, grp in data_nw.group_by(grouping_names)
         )
+        return nw.concat(metrics, how="vertical").to_native()
 
-        if len(grouping_names) > 1:
-            all_indices = pd.MultiIndex.from_product(
-                [np.unique(data[col]) for col in grouping_names], names=grouping_names
-            )
+        # if len(grouping_names) > 1:
+        #     all_indices = pd.MultiIndex.from_product(
+        #         [np.unique(data[col]) for col in grouping_names], names=grouping_names
+        #     )
 
-            return temp.reindex(index=all_indices)
-
-        return temp
+        #     return temp.reindex(index=all_indices)
